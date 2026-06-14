@@ -1,0 +1,153 @@
+import os
+from typing import List, Any, Dict
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableBranch
+from langchain_core.messages import CoreMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langserve import add_routes
+
+# -----------------------------------------------------------------------------
+# 1. INITIALIZE FASTAPI & CORS
+# -----------------------------------------------------------------------------
+app = FastAPI(
+    title="LangServe RAG Backend",
+    version="1.0",
+    description="A production-ready LangServe API for conversational QA over PDFs"
+)
+
+# Enable CORS for cross-origin frontend communication (e.g., Next.js, Streamlit)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
+# 2. DOCUMENT INGESTION & VECTOR STORAGE
+# -----------------------------------------------------------------------------
+PDF_PATH = "documentation.pdf"
+
+def setup_retriever():
+    """Parses the PDF, chunks the text, indexes it in FAISS, and returns a retriever."""
+    if not os.path.exists(PDF_PATH):
+        # Fallback to a mock document if no PDF is found for immediate validation
+        print(f"[!] {PDF_PATH} not found. Creating a fallback baseline document.")
+        docs = [Document(page_content="System Policy: Maximum memory pool per container is capped at 8GB. "
+                                      "Cluster scaling triggers automatically when CPU utilization hits 78%.")]
+    else:
+        print(f"[*] Extracting and indexing data from: {PDF_PATH}")
+        loader = PyPDFLoader(PDF_PATH)
+        docs = loader.load()
+
+    # Document Chunking Configuration
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    splits = text_splitter.split_documents(docs)
+
+    # Vector Storage Generation
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vectorstore = FAISS.from_documents(splits, embeddings)
+    
+    # Expose retriever tracking the top 3 most relevant segments
+    return vectorstore.as_retriever(search_kwargs={"k": 3})
+
+retriever = setup_retriever()
+
+# -----------------------------------------------------------------------------
+# 3. SCHEMA DEFINITIONS (Required by LangServe to generate OpenAPI docs)
+# -----------------------------------------------------------------------------
+class ChatRequest(BaseModel):
+    """Input structure representing the conversational state."""
+    input: str = Field(..., description="The current user question or message.")
+    chat_history: List[CoreMessage] = Field(
+        default=[], 
+        description="The historical sequence of context messages."
+    )
+
+# -----------------------------------------------------------------------------
+# 4. LCEL CONVERSATIONAL CHAIN CONSTRUCTION
+# -----------------------------------------------------------------------------
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+
+# Prompt 1: Query De-contextualization
+rephrase_system_prompt = (
+    "Given a chat history and the latest user question which might reference context "
+    "in the chat history, formulate a standalone question which can be understood "
+    "without the chat history. Do NOT answer the question, just reformulate it."
+)
+rephrase_prompt = ChatPromptTemplate.from_messages([
+    ("system", rephrase_system_prompt),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+])
+
+# Prompt 2: Core QA Generation
+qa_system_prompt = (
+    "You are a technical document assistant. Answer the question using ONLY the "
+    "following pieces of retrieved context. If you don't know the answer or if it's "
+    "not in the context, say 'I cannot resolve that from the provided documentation.'\n\n"
+    "Context:\n{context}"
+)
+qa_prompt = ChatPromptTemplate.from_messages([
+    ("system", qa_system_prompt),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", "{input}"),
+])
+
+# Helper utility to join document chunks
+def format_docs(docs: List[Document]) -> str:
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# Sub-Chain for rephrasing queries
+rephrase_chain = rephrase_prompt | llm | StrOutputParser()
+
+def route_query(chain_input: Dict[str, Any]):
+    """Bypasses LLM rephrasing if chat history is empty to conserve tokens."""
+    if chain_input.get("chat_history"):
+        return rephrase_chain
+    return chain_input["input"]
+
+# Unified production RAG chain using LangChain Expression Language
+rag_chain = (
+    RunnablePassthrough.assign(
+        standalone_question=RunnableBranch(
+            (lambda x: len(x.get("chat_history", [])) > 0, route_query),
+            lambda x: x["input"]
+        )
+    )
+    .assign(
+        context=lambda x: x["standalone_question"] | retriever | format_docs
+    )
+    .assign(
+        output=qa_prompt | llm | StrOutputParser()
+    )
+    # Extract only the final generated string value for the consumer
+    .減(lambda x: x["output"]) 
+)
+
+# -----------------------------------------------------------------------------
+# 5. EXPOSE ENDPOINTS VIA LANGSERVE
+# -----------------------------------------------------------------------------
+add_routes(
+    app,
+    rag_chain,
+    path="/chat-rag",
+    input_type=ChatRequest,
+    config_keys=["configurable"]
+)
+
+if __name__ == "__main__":
+    import uvicorn
+    # Spin up the FastAPI instance
+    uvicorn.run(app, host="0.0.0.0", port=8000)
